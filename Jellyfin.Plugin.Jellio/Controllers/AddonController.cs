@@ -76,7 +76,7 @@ public class AddonController : ControllerBase
             return overrideBaseUrl!.TrimEnd('/');
         }
 
-        return $"{Request.Scheme}://{Request.Host}{Request.PathBase}";
+        return $"https://{Request.Host}{Request.PathBase}";
     }
 
     private static MetaDto MapToMeta(
@@ -107,7 +107,7 @@ public class AddonController : ControllerBase
 
         var meta = new MetaDto
         {
-            Id = dto.ProviderIds.TryGetValue("Imdb", out var idVal) ? idVal : $"jellio:{dto.Id}",
+            Id = $"jellio:{dto.Id}",
             Type = stremioType.ToString().ToLower(CultureInfo.InvariantCulture),
             Name = dto.Name,
             Poster = $"{baseUrl}/Items/{dto.Id}/Images/Primary",
@@ -116,6 +116,9 @@ public class AddonController : ControllerBase
             Description = dto.Overview,
             ImdbRating = dto.CommunityRating?.ToString("F1", CultureInfo.InvariantCulture),
             ReleaseInfo = releaseInfo,
+            Background = dto.BackdropImageTags != null && dto.BackdropImageTags.Length != 0
+                ? $"{baseUrl}/Items/{dto.Id}/Images/Backdrop/0"
+                : null,
         };
 
         if (includeDetails)
@@ -127,10 +130,6 @@ public class AddonController : ControllerBase
             meta.Logo = dto.ImageTags.ContainsKey(ImageType.Logo)
                 ? $"{baseUrl}/Items/{dto.Id}/Images/Logo"
                 : null;
-            meta.Background =
-                dto.BackdropImageTags.Length != 0
-                    ? $"{baseUrl}/Items/{dto.Id}/Images/Backdrop/0"
-                    : null;
             meta.Released = dto.PremiereDate?.ToString("o");
         }
 
@@ -146,41 +145,46 @@ public class AddonController : ControllerBase
             return Ok(new { streams = Array.Empty<object>() });
         }
 
-        LogBuffer.AddLog($"[Stream] Processing {items.Count} item(s) for user {user.Username}", LogLevel.Info);
         var baseUrl = GetBaseUrl();
-        LogBuffer.AddLog($"[Stream] Base URL: {baseUrl}", LogLevel.Info);
         var dtoOptions = new DtoOptions(true);
         var dtos = _dtoService.GetBaseItemDtos(items, dtoOptions, user);
-        LogBuffer.AddLog($"[Stream] Got {dtos.Count} DTO(s)", LogLevel.Info);
-
         var streams = dtos.SelectMany(dto =>
-        {
-            int mediaSourceCount = 0;
-            if (dto.MediaSources != null)
+            dto.MediaSources.Select(source =>
             {
-                mediaSourceCount = dto.MediaSources.Count();
-            }
+                var videoStream = source.MediaStreams?.FirstOrDefault(s => s.Type == MediaBrowser.Model.Entities.MediaStreamType.Video);
+                var audioStream = source.MediaStreams?.FirstOrDefault(s => s.Type == MediaBrowser.Model.Entities.MediaStreamType.Audio);
 
-            LogBuffer.AddLog($"[Stream] Processing DTO: {dto.Name} (Id: {dto.Id}, MediaSources: {mediaSourceCount})", LogLevel.Info);
-            if (dto.MediaSources == null)
-            {
-                return Enumerable.Empty<StreamDto>();
-            }
+                var resolution = videoStream?.Height switch
+                {
+                    >= 2160 => "4K",
+                    >= 1080 => "1080p",
+                    >= 720 => "720p",
+                    >= 480 => "480p",
+                    _ => null
+                };
 
-            return dto.MediaSources.Select(source =>
-            {
-                var streamUrl = $"{baseUrl}/videos/{dto.Id}/stream?mediaSourceId={source.Id}&api_key={Uri.EscapeDataString(authToken)}&AudioCodec=aac&TranscodingMaxAudioChannels=2&CopyTimestamps=true";
-                LogBuffer.AddLog($"[Stream] Generated stream for {dto.Name} ({dto.Id}): {source.Name} - URL: {streamUrl}", LogLevel.Info);
+                var videoCodec = videoStream?.Codec?.ToUpperInvariant();
+                var audioCodec = audioStream?.Codec?.ToUpperInvariant();
+
+                var sizeMB = source.Size.HasValue ? source.Size.Value / (1024.0 * 1024.0) : 0;
+                var sizeStr = sizeMB >= 1024 ? $"{sizeMB / 1024:F1} GB" : $"{sizeMB:F0} MB";
+
+                var infoParts = new[] { resolution, videoCodec, audioCodec, sizeStr }.Where(x => !string.IsNullOrEmpty(x));
+                var name = "Jellio\n" + string.Join(" ", infoParts);
+
+                var descParts = new[] { source.Name, sizeStr }.Where(x => !string.IsNullOrEmpty(x));
+                var description = string.Join(" | ", descParts);
+
+                var streamUrl = $"{baseUrl}/videos/{dto.Id}/stream?mediaSourceId={source.Id}&api_key={Uri.EscapeDataString(authToken)}&Static=true";
+                LogBuffer.AddLog($"[Stream] Generated stream for {dto.Name} ({dto.Id}): {source.Name}", LogLevel.Info);
                 return new StreamDto
                 {
                     Url = streamUrl,
-                    Name = "Jellio",
-                    Description = source.Name,
+                    Name = name,
+                    Description = description,
                 };
-            });
-        }).ToList();
-
-        LogBuffer.AddLog($"[Stream] Returning {streams.Count} stream(s)", LogLevel.Info);
+            })
+        );
         return Ok(new { streams });
     }
 
@@ -286,7 +290,7 @@ public class AddonController : ControllerBase
 
         var dtoOptions = new DtoOptions
         {
-            Fields = [ItemFields.ProviderIds, ItemFields.Overview, ItemFields.Genres],
+            Fields = [ItemFields.ProviderIds, ItemFields.Overview, ItemFields.Genres, ItemFields.PrimaryImageAspectRatio],
         };
 
         var user = _userManager.GetUserById(userId);
@@ -306,7 +310,8 @@ public class AddonController : ControllerBase
             DtoOptions = dtoOptions,
         };
         var result = folder.GetItems(query);
-        var dtos = _dtoService.GetBaseItemDtos(result.Items, dtoOptions, user);
+        var sortedItems = result.Items.OrderByDescending(i => i.PremiereDate ?? DateTime.MinValue).ToArray();
+        var dtos = _dtoService.GetBaseItemDtos(sortedItems, dtoOptions, user);
     var baseUrl = GetBaseUrl();
         var metas = dtos.Select(dto => MapToMeta(dto, stremioType, baseUrl));
 
@@ -388,10 +393,7 @@ public class AddonController : ControllerBase
             return Ok(new { streams = Array.Empty<object>() });
         }
 
-        LogBuffer.AddLog($"[Stream] Found item: {item.Name} (Type: {item.GetType().Name}, Id: {item.Id})", LogLevel.Info);
-        var result = GetStreamsResult(userId, [item], config.AuthToken);
-        LogBuffer.AddLog($"[Stream] Returning stream result for {item.Name}", LogLevel.Info);
-        return result;
+        return GetStreamsResult(userId, [item], config.AuthToken);
     }
 
     [HttpGet("stream/movie/tt{imdbId}.json")]
@@ -448,12 +450,10 @@ public class AddonController : ControllerBase
     )
     {
         var userId = (Guid)HttpContext.Items["JellioUserId"]!;
-        LogBuffer.AddLog($"[Stream] TV Episode request: IMDB={imdbId}, Season={seasonNum}, Episode={episodeNum}", LogLevel.Info);
 
         var user = _userManager.GetUserById(userId);
         if (user == null)
         {
-            LogBuffer.AddLog($"[Stream] User not found: {userId}", LogLevel.Warning);
             return Unauthorized();
         }
 
@@ -463,11 +463,9 @@ public class AddonController : ControllerBase
             HasAnyProviderId = new Dictionary<string, string> { ["Imdb"] = $"tt{imdbId}" },
         };
         var seriesItems = _libraryManager.GetItemList(seriesQuery);
-        LogBuffer.AddLog($"[Stream] Found {seriesItems.Count} series with IMDB tt{imdbId}", LogLevel.Info);
 
         if (seriesItems.Count == 0)
         {
-            LogBuffer.AddLog($"[Stream] Series not found for IMDB tt{imdbId}", LogLevel.Warning);
             // Series not found - show Jellyseerr option if enabled
             if (config.JellyseerrEnabled && !string.IsNullOrWhiteSpace(config.JellyseerrUrl))
             {
@@ -488,7 +486,6 @@ public class AddonController : ControllerBase
         }
 
         var seriesIds = seriesItems.Select(s => s.Id).ToArray();
-        LogBuffer.AddLog($"[Stream] Series IDs: {string.Join(", ", seriesIds)}", LogLevel.Info);
 
         var episodeQuery = new InternalItemsQuery(user)
         {
@@ -498,11 +495,9 @@ public class AddonController : ControllerBase
             IndexNumber = episodeNum,
         };
         var episodeItems = _libraryManager.GetItemList(episodeQuery);
-        LogBuffer.AddLog($"[Stream] Found {episodeItems.Count} episode(s) for Season {seasonNum}, Episode {episodeNum}", LogLevel.Info);
 
         if (episodeItems.Count == 0)
         {
-            LogBuffer.AddLog($"[Stream] Episode not found: Season {seasonNum}, Episode {episodeNum}", LogLevel.Warning);
             // Episode not found - show Jellyseerr option if enabled
             if (config.JellyseerrEnabled && !string.IsNullOrWhiteSpace(config.JellyseerrUrl))
             {
@@ -522,7 +517,6 @@ public class AddonController : ControllerBase
             return Ok(new { streams = Array.Empty<object>() });
         }
 
-        LogBuffer.AddLog($"[Stream] Returning streams for {episodeItems.Count} episode(s)", LogLevel.Info);
         return GetStreamsResult(userId, episodeItems, config.AuthToken);
     }
 }
